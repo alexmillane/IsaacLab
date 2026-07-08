@@ -24,6 +24,8 @@ from isaaclab.sim import CollisionPropertiesCfg, RigidBodyPropertiesCfg, UsdFile
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+from isaaclab.sensors import ContactSensorCfg
+from isaaclab.assets import RigidObjectCfg
 
 import isaaclab_tasks.manager_based.manipulation.reach.mdp as mdp
 from isaaclab_tasks.utils import PresetCfg
@@ -88,6 +90,44 @@ class ReachSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -1.05)),
+    )
+
+    dex_cube = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/dex_cube",
+        spawn=UsdFileCfg(
+            usd_path = f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+            activate_contact_sensors=True,
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 3.0),
+            rot=(0.0, 0.0, 0.0, 1.0),
+        ),
+    )
+
+    microwave = ArticulationCfg(
+        prim_path="/World/envs/env_.*/microwave",
+        spawn=UsdFileCfg(
+            usd_path = f"omniverse://isaac-dev.ov.nvidia.com/Users/amillane@nvidia.com/isaaclab_arena/repros/Microwave039/Microwave039.usd"
+        ),
+        actuators={},
+        articulation_root_prim_path="",
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.5, 0.0, 0.25),
+            rot=(0, 0, -0.7071068, 0.7071068 ),
+        ),
+    )
+
+    # This causes issues:
+    # - Works on IsaacLab 3.0 Beta 1
+    # - Fails on IsaacLab 3.0 Beta 2
+    #
+    # Repo command: ./isaaclab.sh -p scripts/environments/zero_agent.py --num_envs 1 --viz kit --task Isaac-Reach-Franka-v0
+    # Error:
+    #  2026-07-08T12:36:30Z [20,836ms] [Error] [omni.physx.tensors.plugin] Filter pattern '/World/envs/env_*/microwave/Microwave039_Disc001' did not match the correct number of entries (expected 1, found 2)
+    #  2026-07-08T12:36:30Z [20,836ms] [Error] [omni.physx.tensors.plugin] Pattern '/World/envs/env_*/(dex_cube)' did not match any rigid contact for filters
+    cube_to_microwave_disk_contact_sensor = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/dex_cube",
+        filter_prim_paths_expr=["/World/envs/env_.*/microwave/Microwave039_Disc001"],
     )
 
     table = TableCfg()
