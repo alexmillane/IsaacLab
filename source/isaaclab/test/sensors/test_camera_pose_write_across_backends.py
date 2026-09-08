@@ -16,6 +16,9 @@ to every visible surface, and check the two observable consequences of the write
 
 - ``_moves_reported_pose_*`` reads ``camera.data.pos_w`` (deterministic, no renderer involved).
 - ``_moves_render_*`` compares the rendered depth before and after the move.
+
+Set ``ISAACLAB_TEST_SAVE_IMAGES=1`` to dump the compared depth frames as PNGs under
+``<this directory>/output/<test name>/``, which shows the Newton render sitting at the old pose.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -24,6 +27,8 @@ from isaaclab.app import AppLauncher
 
 # launch omniverse app
 simulation_app = AppLauncher(headless=True, enable_cameras=True).app
+
+import os
 
 import numpy as np
 import pytest
@@ -43,6 +48,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.rendering, pytest.mark.isaacs
 BACKEND_CFGS = [PhysxCfg(), NewtonCfg(solver_cfg=MJWarpSolverCfg())]
 BACKEND_IDS = ["physx", "newton"]
 
+# Dump the compared depth frames for inspection; off by default so the test writes nothing.
+SAVE_IMAGES = os.environ.get("ISAACLAB_TEST_SAVE_IMAGES", "0") == "1"
+IMAGE_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
+
 
 @configclass
 class _SceneCfg(InteractiveSceneCfg):
@@ -60,12 +69,40 @@ class _SceneCfg(InteractiveSceneCfg):
     )
 
 
-def _capture_at_heights(physics_cfg, heights_m: tuple[float, ...]) -> list[tuple[torch.Tensor, float]]:
+def _save_depth_images(depths: list[torch.Tensor], heights_m: tuple[float, ...], output_subdir: str) -> None:
+    """Write one PNG per camera height into ``IMAGE_OUTPUT_DIR/<output_subdir>/``, created on demand.
+
+    Grey level maps depth against a fixed scale set by the highest commanded camera pose, rather than
+    against each frame's own range: a camera that did not move then renders identically across heights,
+    and the frames stay comparable across backends. Headroom covers the oblique corner rays, which are
+    longer than the camera height.
+    """
+    from PIL import Image
+
+    output_dir = os.path.join(IMAGE_OUTPUT_DIR, output_subdir)
+    os.makedirs(output_dir, exist_ok=True)
+    scale_m = 1.5 * max(heights_m)
+    for height, depth in zip(heights_m, depths):
+        grey = (depth.squeeze(0).squeeze(-1) / scale_m * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+        output_path = os.path.join(output_dir, f"depth-{height:g}m.png")
+        Image.fromarray(grey.numpy()).save(output_path)
+        print(f"Wrote {output_path}", flush=True)
+
+
+def _capture_at_heights(
+    physics_cfg, heights_m: tuple[float, ...], image_subdir: str | None = None
+) -> list[tuple[torch.Tensor, float]]:
     """Move the camera to each height in turn, returning its ``(pos_w, mean visible depth [m])`` at each.
 
     The camera looks straight down at the ground plane, so the depth it reports is dominated by its height.
     It spawns at the first height rather than at the origin, so that a dropped pose write leaves a valid
     (but unchanged) depth image rather than an empty one.
+
+    Args:
+        physics_cfg: The physics backend configuration to build the simulation with.
+        heights_m: Camera heights [m] above the ground plane to capture at, in order.
+        image_subdir: When given and ``SAVE_IMAGES`` is set, the depth frames are written to this
+            subdirectory of :obj:`IMAGE_OUTPUT_DIR`.
     """
     device = "cuda:0"
     # Physics steps taken after each pose write so the renderer produces a frame at the new pose.
@@ -87,6 +124,7 @@ def _capture_at_heights(physics_cfg, heights_m: tuple[float, ...]) -> list[tuple
 
     sim_cfg = SimulationCfg(physics=physics_cfg, device=device)
     captures = []
+    depths = []
     with build_simulation_context(device=device, sim_cfg=sim_cfg, add_ground_plane=True, add_lighting=True) as sim:
         sim._app_control_on_stop_handle = None
         InteractiveScene(_SceneCfg(num_envs=1, env_spacing=2.0))
@@ -105,19 +143,24 @@ def _capture_at_heights(physics_cfg, heights_m: tuple[float, ...]) -> list[tuple
             visible = depth[torch.isfinite(depth) & (depth < max_range_m)]
             assert visible.numel() > 0, "No valid depth pixels; the camera sees no geometry."
             captures.append((camera.data.pos_w.torch.detach().float().cpu().clone(), visible.mean().item()))
+            # Sky pixels come back at the far clipping range; clamp them so they do not dominate the scale.
+            depths.append(torch.nan_to_num(depth, posinf=0.0).clamp(max=visible.max().item()))
 
         del camera
+
+    if SAVE_IMAGES and image_subdir is not None:
+        _save_depth_images(depths, heights_m, image_subdir)
     return captures
 
 
 @pytest.mark.parametrize("physics_cfg", BACKEND_CFGS, ids=BACKEND_IDS)
-def test_camera_pose_write_moves_reported_pose(physics_cfg):
+def test_camera_pose_write_moves_reported_pose(physics_cfg, request):
     """``camera.data.pos_w`` follows a ``set_world_poses`` write on every backend."""
     # Camera heights [m] above the ground plane, and the reported shift below which the write was dropped.
     close_m, far_m = 2.0, 8.0
     pose_shift_threshold_m = 0.5 * (far_m - close_m)
 
-    (pos_close, _), (pos_far, _) = _capture_at_heights(physics_cfg, (close_m, far_m))
+    (pos_close, _), (pos_far, _) = _capture_at_heights(physics_cfg, (close_m, far_m), request.node.name)
 
     np.testing.assert_allclose(pos_close.numpy(), [[0.0, 0.0, close_m]], atol=1e-3)
     np.testing.assert_allclose(pos_far.numpy(), [[0.0, 0.0, far_m]], atol=1e-3)
@@ -128,7 +171,7 @@ def test_camera_pose_write_moves_reported_pose(physics_cfg):
 
 
 @pytest.mark.parametrize("physics_cfg", BACKEND_CFGS, ids=BACKEND_IDS)
-def test_camera_pose_write_moves_render(physics_cfg):
+def test_camera_pose_write_moves_render(physics_cfg, request):
     """The rendered depth follows a ``set_world_poses`` write on every backend.
 
     Under Newton the ``NewtonSiteFrameView`` write never reaches the camera prim the RTX renderer reads,
@@ -140,7 +183,7 @@ def test_camera_pose_write_moves_render(physics_cfg):
     close_m, far_m = 2.0, 8.0
     depth_ratio_threshold = 1.5
 
-    (_, depth_close_m), (_, depth_far_m) = _capture_at_heights(physics_cfg, (close_m, far_m))
+    (_, depth_close_m), (_, depth_far_m) = _capture_at_heights(physics_cfg, (close_m, far_m), request.node.name)
 
     ratio = depth_far_m / depth_close_m
     assert ratio > depth_ratio_threshold, (
