@@ -69,6 +69,33 @@ class _SceneCfg(InteractiveSceneCfg):
     )
 
 
+# Visual-only markers giving the render something to move against: a 0.5 m cube directly under the camera,
+# which shrinks as the camera rises, flanked by two that sit outside the frame at the close height and only
+# come into view at the far one. Coloured to stand out against the dark ground plane.
+#
+# They are spawned at ``/World`` rather than as scene entities because geometry placed under
+# ``/World/envs/env_*`` by :class:`InteractiveScene` does not reach the RTX renderer in a bare
+# :func:`build_simulation_context` (the same prim spawned at ``/World`` renders), so the scene cube above
+# is invisible and serves only to give Newton a body to build its model from.
+_MARKERS = (
+    ((0.0, 0.0, 0.25), (0.9, 0.3, 0.1)),
+    ((-1.5, 0.0, 0.25), (0.2, 0.6, 0.9)),
+    ((1.5, 0.0, 0.25), (0.3, 0.8, 0.3)),
+)
+
+
+def _spawn_visual_markers() -> None:
+    """Spawn the marker cubes as plain USD gprims, with no physics attached."""
+    from pxr import Gf, UsdGeom
+
+    for index, (translation, color) in enumerate(_MARKERS):
+        # A UsdGeom.Cube has size 2.0, so a 0.25 scale gives a 0.5 m box.
+        prim = sim_utils.create_prim(f"/World/Marker_{index}", "Cube", translation=translation, scale=(0.25,) * 3)
+        geom = UsdGeom.Cube(prim)
+        geom.CreateDisplayColorAttr()
+        geom.GetDisplayColorAttr().Set([Gf.Vec3f(*color)])
+
+
 def _save_images(
     depths: list[torch.Tensor], rgbs: list[torch.Tensor], heights_m: tuple[float, ...], output_subdir: str
 ) -> None:
@@ -136,6 +163,7 @@ def _capture_at_heights(
     with build_simulation_context(device=device, sim_cfg=sim_cfg, add_ground_plane=True, add_lighting=True) as sim:
         sim._app_control_on_stop_handle = None
         InteractiveScene(_SceneCfg(num_envs=1, env_spacing=2.0))
+        _spawn_visual_markers()
         camera = Camera(camera_cfg)
         sim.reset()
 
