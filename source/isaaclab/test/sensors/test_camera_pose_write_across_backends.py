@@ -17,7 +17,7 @@ to every visible surface, and check the two observable consequences of the write
 - ``_moves_reported_pose_*`` reads ``camera.data.pos_w`` (deterministic, no renderer involved).
 - ``_moves_render_*`` compares the rendered depth before and after the move.
 
-Set ``ISAACLAB_TEST_SAVE_IMAGES=1`` to dump the compared depth frames as PNGs under
+Set ``ISAACLAB_TEST_SAVE_IMAGES=1`` to dump the compared depth and RGB frames as PNGs under
 ``<this directory>/output/<test name>/``, which shows the Newton render sitting at the old pose.
 """
 
@@ -48,7 +48,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.rendering, pytest.mark.isaacs
 BACKEND_CFGS = [PhysxCfg(), NewtonCfg(solver_cfg=MJWarpSolverCfg())]
 BACKEND_IDS = ["physx", "newton"]
 
-# Dump the compared depth frames for inspection; off by default so the test writes nothing.
+# Dump the compared depth and RGB frames for inspection; off by default so the test writes nothing.
 SAVE_IMAGES = os.environ.get("ISAACLAB_TEST_SAVE_IMAGES", "0") == "1"
 IMAGE_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
@@ -69,24 +69,31 @@ class _SceneCfg(InteractiveSceneCfg):
     )
 
 
-def _save_depth_images(depths: list[torch.Tensor], heights_m: tuple[float, ...], output_subdir: str) -> None:
-    """Write one PNG per camera height into ``IMAGE_OUTPUT_DIR/<output_subdir>/``, created on demand.
+def _save_images(
+    depths: list[torch.Tensor], rgbs: list[torch.Tensor], heights_m: tuple[float, ...], output_subdir: str
+) -> None:
+    """Write a depth and an RGB PNG per camera height into ``IMAGE_OUTPUT_DIR/<output_subdir>/``.
 
-    Grey level maps depth against a fixed scale set by the highest commanded camera pose, rather than
-    against each frame's own range: a camera that did not move then renders identically across heights,
-    and the frames stay comparable across backends. Headroom covers the oblique corner rays, which are
-    longer than the camera height.
+    The two views show the move differently: depth reads it as overall brightness, RGB as more of the
+    ground plane's grid falling inside the frame. Depth grey level maps against a fixed scale set by the
+    highest commanded camera pose, rather than against each frame's own range: a camera that did not move
+    then renders identically across heights, and the frames stay comparable across backends. Headroom
+    covers the oblique corner rays, which are longer than the camera height.
     """
     from PIL import Image
 
     output_dir = os.path.join(IMAGE_OUTPUT_DIR, output_subdir)
     os.makedirs(output_dir, exist_ok=True)
     scale_m = 1.5 * max(heights_m)
-    for height, depth in zip(heights_m, depths):
-        grey = (depth.squeeze(0).squeeze(-1) / scale_m * 255.0).clamp(0.0, 255.0).to(torch.uint8)
-        output_path = os.path.join(output_dir, f"depth-{height:g}m.png")
-        Image.fromarray(grey.numpy()).save(output_path)
-        print(f"Wrote {output_path}", flush=True)
+    for height, depth, rgb in zip(heights_m, depths, rgbs):
+        images = {
+            "depth": (depth.squeeze(0).squeeze(-1) / scale_m * 255.0).clamp(0.0, 255.0).to(torch.uint8),
+            "rgb": rgb.squeeze(0)[..., :3].to(torch.uint8),
+        }
+        for data_type, image in images.items():
+            output_path = os.path.join(output_dir, f"{data_type}-{height:g}m.png")
+            Image.fromarray(image.numpy()).save(output_path)
+            print(f"Wrote {output_path}", flush=True)
 
 
 def _capture_at_heights(
@@ -101,8 +108,8 @@ def _capture_at_heights(
     Args:
         physics_cfg: The physics backend configuration to build the simulation with.
         heights_m: Camera heights [m] above the ground plane to capture at, in order.
-        image_subdir: When given and ``SAVE_IMAGES`` is set, the depth frames are written to this
-            subdirectory of :obj:`IMAGE_OUTPUT_DIR`.
+        image_subdir: When given and ``SAVE_IMAGES`` is set, the depth and RGB frames are written to
+            this subdirectory of :obj:`IMAGE_OUTPUT_DIR`.
     """
     device = "cuda:0"
     # Physics steps taken after each pose write so the renderer produces a frame at the new pose.
@@ -114,7 +121,7 @@ def _capture_at_heights(
         width=256,
         update_period=0,
         update_latest_camera_pose=True,
-        data_types=["distance_to_camera"],
+        data_types=["distance_to_camera", "rgb"],
         # OpenGL convention: the camera looks along its -Z axis, so identity orientation looks straight down.
         offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, heights_m[0]), rot=(0.0, 0.0, 0.0, 1.0), convention="opengl"),
         spawn=sim_utils.PinholeCameraCfg(
@@ -125,6 +132,7 @@ def _capture_at_heights(
     sim_cfg = SimulationCfg(physics=physics_cfg, device=device)
     captures = []
     depths = []
+    rgbs = []
     with build_simulation_context(device=device, sim_cfg=sim_cfg, add_ground_plane=True, add_lighting=True) as sim:
         sim._app_control_on_stop_handle = None
         InteractiveScene(_SceneCfg(num_envs=1, env_spacing=2.0))
@@ -145,11 +153,12 @@ def _capture_at_heights(
             captures.append((camera.data.pos_w.torch.detach().float().cpu().clone(), visible.mean().item()))
             # Sky pixels come back at the far clipping range; clamp them so they do not dominate the scale.
             depths.append(torch.nan_to_num(depth, posinf=0.0).clamp(max=visible.max().item()))
+            rgbs.append(camera.data.output["rgb"].torch.detach().float().cpu())
 
         del camera
 
     if SAVE_IMAGES and image_subdir is not None:
-        _save_depth_images(depths, heights_m, image_subdir)
+        _save_images(depths, rgbs, heights_m, image_subdir)
     return captures
 
 
